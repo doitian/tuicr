@@ -10,51 +10,76 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  probe:
-    name: Probe paths (${{ matrix.os }})
+  variants:
+    name: Test variants (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, ubuntu-latest]
+        os: [macos-latest, macos-15, ubuntu-latest]
     steps:
-      - name: Git version
-        run: git --version
-      - name: Separate git dir path probe
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Probe git versions and gitfile contents
         run: |
           set -x
-          echo "TMPDIR=$TMPDIR"
-          tmp=$(mktemp -d)
-          worktree="$tmp/repo"
-          git init -q -b main --separate-git-dir "$tmp/repo.git" "$worktree"
-          echo "--- worktree path as created: $worktree"
-          echo "--- canonicalized:            $(realpath "$worktree")"
-          echo "--- .git gitfile contents:"
-          cat "$worktree/.git"
-          echo "--- gitdir canonicalized:     $(realpath "$tmp/repo.git")"
-          echo "--- ls -ld worktree:"
-          ls -ld "$worktree" "$tmp"
-          echo "--- git rev-parse --show-toplevel:"
-          git -C "$worktree" rev-parse --show-toplevel
-          echo "--- gitdir config:"
-          cat "$tmp/repo.git/config"
+          echo "PATH git: $(command -v git) $(git --version)"
+          echo "Apple git: $(/usr/bin/git --version 2>&1 || echo none)"
+          for g in "$(command -v git)" /usr/bin/git; do
+            [ -x "$g" ] || continue
+            echo "=== gitfile written by $g ==="
+            tmp=$(mktemp -d)
+            "$g" init -q -b main --separate-git-dir "$tmp/repo.git" "$tmp/repo"
+            cat "$tmp/repo/.git"
+            echo "--- gitdir config:"
+            cat "$tmp/repo.git/config"
+            rm -rf "$tmp"
+          done
 
-  macos-test:
-    name: should_resolve_worktree_for_separate_git_dir (macOS)
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run the regression test
-        run: cargo test --lib should_resolve_worktree_for_separate_git_dir -- --nocapture
+      - name: Build test binary
+        run: |
+          cargo test --lib --no-run --message-format=json \
+            | jq -r 'select(.profile.test == true and .target.name == "tuicr") | .executable' \
+            | tee /tmp/testbin.txt
 
-  linux-test:
-    name: should_resolve_worktree_for_separate_git_dir (Linux control)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Run the regression test
-        run: cargo test --lib should_resolve_worktree_for_separate_git_dir -- --nocapture
+      - name: Run scenarios
+        run: |
+          set -u
+          testbin=$(head -1 /tmp/testbin.txt)
+          echo "test binary: $testbin"
+
+          mkdir -p /tmp/gitshim
+          ln -sf /usr/bin/git /tmp/gitshim/git || true
+
+          mkdir -p "$HOME/real-tmp"
+          ln -sfn "$HOME/real-tmp" "$HOME/link-tmp"
+
+          run() {
+            label="$1"; shift
+            echo "::group::scenario: $label"
+            "$@" "$testbin" --exact --nocapture \
+              vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir
+            echo "exit=$?"
+            echo "::endgroup::"
+          }
+
+          echo "## default"
+          echo "TMPDIR=${TMPDIR:-<unset>}"
+          run "default" env
+
+          echo "## TMPDIR=/tmp"
+          run "tmpdir-/tmp" env TMPDIR=/tmp
+
+          echo "## TMPDIR=$HOME/link-tmp (symlinked)"
+          run "tmpdir-symlink" env TMPDIR="$HOME/link-tmp"
+
+          echo "## TMPDIR=$RUNNER_TEMP"
+          run "tmpdir-runner-temp" env TMPDIR="$RUNNER_TEMP"
+
+          echo "## Apple git shim, default TMPDIR"
+          run "apple-git" env PATH="/tmp/gitshim:$PATH"
+
+          echo "## Apple git shim + symlinked TMPDIR"
+          run "apple-git-symlink-tmp" env PATH="/tmp/gitshim:$PATH" TMPDIR="$HOME/link-tmp"
