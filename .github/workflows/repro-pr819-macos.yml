@@ -10,55 +10,66 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  variants:
-    name: Test variants (${{ matrix.os }})
+  crossfs:
+    name: Cross-filesystem symlinks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15, macos-15-intel, ubuntu-latest]
+        os: [macos-latest, macos-15-intel, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Probe git versions and gitfile contents
-        run: |
-          set -x
-          uname -m
-          echo "PATH git: $(command -v git) $(git --version)"
-          echo "Apple git: $(/usr/bin/git --version 2>&1 || echo none)"
-          for g in "$(command -v git)" /usr/bin/git; do
-            [ -x "$g" ] || continue
-            echo "=== gitfile written by $g ==="
-            tmp=$(mktemp -d)
-            "$g" init -q -b main --separate-git-dir "$tmp/repo.git" "$tmp/repo"
-            cat "$tmp/repo/.git"
-            rm -rf "$tmp"
-          done
-
-      - name: Build test binary
+      - name: Build test binary and probe
         run: |
           cargo test --lib --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .target.name == "tuicr") | .executable' \
             | tee /tmp/testbin.txt
           cargo build -q --example gitlink_probe
 
-      - name: Run scenarios
+      - name: Create second filesystem and cross-filesystem symlinks
+        run: |
+          set -eu
+          fs1="$RUNNER_TEMP"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            fs2="$HOME/fs2mnt"
+            img="$RUNNER_TEMP/fs2.dmg"
+            mkdir -p "$fs2"
+            hdiutil create -size 256m -fs APFS -volname fs2 -ov "$img" >/dev/null
+            hdiutil attach "$img" -mountpoint "$fs2" -nobrowse -noautoopen >/dev/null
+            sudo -n chown "$(id -un)" "$fs2" 2>/dev/null || true
+          else
+            fs2=/mnt/fs2
+            sudo mkdir -p "$fs2"
+            sudo mount -t tmpfs -o size=256m tmpfs "$fs2"
+            sudo chown "$(id -un)" "$fs2"
+          fi
+          echo "FS1=$fs1" >> "$GITHUB_ENV"
+          echo "FS2=$fs2" >> "$GITHUB_ENV"
+
+          mkdir -p "$fs2/real" "$fs1/fs1real"
+          # link lives on FS1, target lives on FS2
+          ln -sfn "$fs2/real" "$fs1/link-tmp"
+          # link lives on FS2, target lives on FS1
+          ln -sfn "$fs1/fs1real" "$fs2/link-back"
+
+          set -x
+          df -h "$fs1" "$fs2" || true
+          stat -c '%d %n' "$fs1" "$fs2" 2>/dev/null || stat -f '%d %n' "$fs1" "$fs2"
+          ls -l "$fs1/link-tmp" "$fs2/link-back"
+          git --version
+          (/usr/bin/git --version || true)
+
+      - name: Run the unit test and probe under each layout
         run: |
           set -u
           testbin=$(head -1 /tmp/testbin.txt)
-          echo "test binary: $testbin"
 
-          mkdir -p /tmp/gitshim
-          ln -sf /usr/bin/git /tmp/gitshim/git || true
-
-          mkdir -p "$HOME/real-tmp"
-          ln -sfn "$HOME/real-tmp" "$HOME/link-tmp"
-
-          run() {
+          runtest() {
             label="$1"; shift
-            echo "::group::scenario: $label"
+            echo "::group::unit test: $label"
             if "$@" "$testbin" --exact --nocapture \
               vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir; then
               echo "RESULT $label: PASS"
@@ -69,46 +80,37 @@ jobs:
           }
 
           probe() {
-            label="$1"; shift
-            echo "::group::probe: $label"
-            "$@" target/debug/examples/gitlink_probe || true
+            echo "::group::probe: $*"
+            target/debug/examples/gitlink_probe "$@" || echo "PROBE FAILED: $*"
             echo "::endgroup::"
           }
 
-          echo "## default"
-          echo "TMPDIR=${TMPDIR:-<unset>}"
-          run "default" env
-          probe "default" env
+          echo "## unit test with TMPDIR on FS1 (link target on FS2)"
+          runtest "tmpdir-crossfs-symlink" env TMPDIR="$FS1/link-tmp"
 
-          echo "## TMPDIR=/tmp"
-          run "tmpdir-/tmp" env TMPDIR=/tmp
-          probe "tmpdir-/tmp" env TMPDIR=/tmp
+          echo "## unit test with TMPDIR on FS2 (real path)"
+          runtest "tmpdir-fs2" env TMPDIR="$FS2/real"
 
-          echo "## TMPDIR=$HOME/link-tmp (symlinked)"
-          run "tmpdir-symlink" env TMPDIR="$HOME/link-tmp"
-          probe "tmpdir-symlink" env TMPDIR="$HOME/link-tmp"
+          echo "## unit test with TMPDIR on FS2 reached through FS2 symlink"
+          mkdir -p "$FS1/fs1real"
+          runtest "tmpdir-backlink" env TMPDIR="$FS2/link-back"
 
-          echo "## Apple git shim, default TMPDIR"
-          run "apple-git" env PATH="/tmp/gitshim:$PATH"
+          probe --tag same-fs1 --worktree-base "$FS1/wt" --gitdir-base "$FS1/git"
+          probe --tag same-fs2 --worktree-base "$FS2/wt" --gitdir-base "$FS2/git"
+          probe --tag xtmp-default
+          probe --tag xtmp-crossfs --worktree-base "$FS1/link-tmp/wt" --gitdir-base "$FS1/link-tmp/git"
+          probe --tag wt-fs1_git-fs2 --worktree-base "$FS1/wt" --gitdir-base "$FS2/git"
+          probe --tag wt-fs2_git-fs1 --worktree-base "$FS2/wt" --gitdir-base "$FS1/git"
+          probe --tag wt-symlink_fs1-target_git-fs1 --worktree-base "$FS1/link-tmp/wt" --gitdir-base "$FS1/git"
+          probe --tag wt-symlink_fs1-target_git-fs2 --worktree-base "$FS1/link-tmp/wt" --gitdir-base "$FS2/git"
+          probe --tag wt-backlink_fs2-target_git-fs1 --worktree-base "$FS2/link-back/wt" --gitdir-base "$FS1/git"
 
-      - name: System libgit2 variant
-        if: runner.os == 'macOS'
+      - name: Detach second filesystem
+        if: always()
         run: |
           set -u
-          if ! command -v pkg-config >/dev/null; then
-            echo "RESULT system-libgit2: skipped (no pkg-config)"
-            exit 0
-          fi
-          brew install libgit2 || true
-          echo "system libgit2: $(pkg-config --modversion libgit2 2>&1 || echo not-found)"
-          testbin=$(head -1 /tmp/testbin.txt)
-          LIBGIT2_SYS_USE_PKG_CONFIG=1 LIBGIT2_NO_VENDOR=1 cargo test --lib --no-run \
-            --message-format=json 2>&1 | tail -5 || true
-          LIBGIT2_SYS_USE_PKG_CONFIG=1 LIBGIT2_NO_VENDOR=1 cargo build -q --example gitlink_probe || true
-          target/debug/examples/gitlink_probe || true
-          if "$testbin" --exact --nocapture \
-            vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir; then
-            echo "RESULT system-libgit2: PASS"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            hdiutil detach "$FS2" -force >/dev/null 2>&1 || true
           else
-            echo "RESULT system-libgit2: FAIL"
+            sudo umount "$FS2" || true
           fi
