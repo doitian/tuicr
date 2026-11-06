@@ -1,0 +1,60 @@
+name: Repro PR 819 macOS
+
+on:
+  push:
+    branches: ["tmp/**"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  probe:
+    name: Probe paths (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    steps:
+      - name: Git version
+        run: git --version
+      - name: Separate git dir path probe
+        run: |
+          set -x
+          echo "TMPDIR=$TMPDIR"
+          tmp=$(mktemp -d)
+          worktree="$tmp/repo"
+          git init -q -b main --separate-git-dir "$tmp/repo.git" "$worktree"
+          echo "--- worktree path as created: $worktree"
+          echo "--- canonicalized:            $(realpath "$worktree")"
+          echo "--- .git gitfile contents:"
+          cat "$worktree/.git"
+          echo "--- gitdir canonicalized:     $(realpath "$tmp/repo.git")"
+          echo "--- ls -ld worktree:"
+          ls -ld "$worktree" "$tmp"
+          echo "--- git rev-parse --show-toplevel:"
+          git -C "$worktree" rev-parse --show-toplevel
+          echo "--- gitdir config:"
+          cat "$tmp/repo.git/config"
+
+  macos-test:
+    name: should_resolve_worktree_for_separate_git_dir (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the regression test
+        run: cargo test --lib should_resolve_worktree_for_separate_git_dir -- --nocapture
+
+  linux-test:
+    name: should_resolve_worktree_for_separate_git_dir (Linux control)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the regression test
+        run: cargo test --lib should_resolve_worktree_for_separate_git_dir -- --nocapture
