@@ -16,7 +16,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15, ubuntu-latest]
+        os: [macos-latest, macos-15, macos-15-intel, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +25,7 @@ jobs:
       - name: Probe git versions and gitfile contents
         run: |
           set -x
+          uname -m
           echo "PATH git: $(command -v git) $(git --version)"
           echo "Apple git: $(/usr/bin/git --version 2>&1 || echo none)"
           for g in "$(command -v git)" /usr/bin/git; do
@@ -33,8 +34,6 @@ jobs:
             tmp=$(mktemp -d)
             "$g" init -q -b main --separate-git-dir "$tmp/repo.git" "$tmp/repo"
             cat "$tmp/repo/.git"
-            echo "--- gitdir config:"
-            cat "$tmp/repo.git/config"
             rm -rf "$tmp"
           done
 
@@ -43,6 +42,7 @@ jobs:
           cargo test --lib --no-run --message-format=json \
             | jq -r 'select(.profile.test == true and .target.name == "tuicr") | .executable' \
             | tee /tmp/testbin.txt
+          cargo build -q --example gitlink_probe
 
       - name: Run scenarios
         run: |
@@ -59,27 +59,56 @@ jobs:
           run() {
             label="$1"; shift
             echo "::group::scenario: $label"
-            "$@" "$testbin" --exact --nocapture \
-              vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir
-            echo "exit=$?"
+            if "$@" "$testbin" --exact --nocapture \
+              vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir; then
+              echo "RESULT $label: PASS"
+            else
+              echo "RESULT $label: FAIL"
+            fi
+            echo "::endgroup::"
+          }
+
+          probe() {
+            label="$1"; shift
+            echo "::group::probe: $label"
+            "$@" target/debug/examples/gitlink_probe || true
             echo "::endgroup::"
           }
 
           echo "## default"
           echo "TMPDIR=${TMPDIR:-<unset>}"
           run "default" env
+          probe "default" env
 
           echo "## TMPDIR=/tmp"
           run "tmpdir-/tmp" env TMPDIR=/tmp
+          probe "tmpdir-/tmp" env TMPDIR=/tmp
 
           echo "## TMPDIR=$HOME/link-tmp (symlinked)"
           run "tmpdir-symlink" env TMPDIR="$HOME/link-tmp"
-
-          echo "## TMPDIR=$RUNNER_TEMP"
-          run "tmpdir-runner-temp" env TMPDIR="$RUNNER_TEMP"
+          probe "tmpdir-symlink" env TMPDIR="$HOME/link-tmp"
 
           echo "## Apple git shim, default TMPDIR"
           run "apple-git" env PATH="/tmp/gitshim:$PATH"
 
-          echo "## Apple git shim + symlinked TMPDIR"
-          run "apple-git-symlink-tmp" env PATH="/tmp/gitshim:$PATH" TMPDIR="$HOME/link-tmp"
+      - name: System libgit2 variant
+        if: runner.os == 'macOS'
+        run: |
+          set -u
+          if ! command -v pkg-config >/dev/null; then
+            echo "RESULT system-libgit2: skipped (no pkg-config)"
+            exit 0
+          fi
+          brew install libgit2 || true
+          echo "system libgit2: $(pkg-config --modversion libgit2 2>&1 || echo not-found)"
+          testbin=$(head -1 /tmp/testbin.txt)
+          LIBGIT2_SYS_USE_PKG_CONFIG=1 LIBGIT2_NO_VENDOR=1 cargo test --lib --no-run \
+            --message-format=json 2>&1 | tail -5 || true
+          LIBGIT2_SYS_USE_PKG_CONFIG=1 LIBGIT2_NO_VENDOR=1 cargo build -q --example gitlink_probe || true
+          target/debug/examples/gitlink_probe || true
+          if "$testbin" --exact --nocapture \
+            vcs::git::libgit2::tests::should_resolve_worktree_for_separate_git_dir; then
+            echo "RESULT system-libgit2: PASS"
+          else
+            echo "RESULT system-libgit2: FAIL"
+          fi
